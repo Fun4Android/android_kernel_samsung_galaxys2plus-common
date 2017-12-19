@@ -1,16 +1,17 @@
 /* drivers/misc/lowmemorykiller.c
  *
  * The lowmemorykiller driver lets user-space specify a set of memory thresholds
- * where processes with a range of oom_adj values will get killed. Specify the
- * minimum oom_adj values in /sys/module/lowmemorykiller/parameters/adj and the
- * number of free pages in /sys/module/lowmemorykiller/parameters/minfree. Both
- * files take a comma separated list of numbers in ascending order.
+ * where processes with a range of oom_score_adj values will get killed. Specify
+ * the minimum oom_score_adj values in
+ * /sys/module/lowmemorykiller/parameters/adj and the number of free pages in
+ * /sys/module/lowmemorykiller/parameters/minfree. Both files take a comma
+ * separated list of numbers in ascending order.
  *
  * For example, write "0,8" to /sys/module/lowmemorykiller/parameters/adj and
- * "1024,4096" to /sys/module/lowmemorykiller/parameters/minfree to kill processes
- * with a oom_adj value of 8 or higher when the free memory drops below 4096 pages
- * and kill processes with a oom_adj value of 0 or higher when the free memory
- * drops below 1024 pages.
+ * "1024,4096" to /sys/module/lowmemorykiller/parameters/minfree to kill
+ * processes with a oom_score_adj value of 8 or higher when the free memory
+ * drops below 4096 pages and kill processes with a oom_score_adj value of 0 or
+ * higher when the free memory drops below 1024 pages.
  *
  * The driver considers memory used for caches to be free, but if a large
  * percentage of the cached memory is locked this can be very inaccurate
@@ -27,9 +28,6 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
  *
- * This is Modified by Samsung Electronics
- * Taewan Kim <taewan95.kim@samsung.com>
- *
  */
 
 #include <linux/module.h>
@@ -37,32 +35,15 @@
 #include <linux/mm.h>
 #include <linux/oom.h>
 #include <linux/sched.h>
+#include <linux/rcupdate.h>
 #include <linux/notifier.h>
-
 #define ENHANCED_LMK_ROUTINE
-#define LMK_COUNT_READ
 
 #ifdef ENHANCED_LMK_ROUTINE
 #define LOWMEM_DEATHPENDING_DEPTH 3
 #endif
 
-#ifdef CONFIG_CMA
-
-#if defined(CONFIG_MACH_CAPRI_SS_BAFFIN)
-#define CMA_ALLOC_MAX_PAGE	24320	/* 95MB */
-//#define CMA_ALLOC_MAX_PAGE    17920   /* 70MB */
-#define CMA_ALLOC_MIN_PAGE	5120	/* 20MB */
-#else
-#define CMA_ALLOC_MAX_PAGE    8960   /* 35MB */
-#define CMA_ALLOC_MIN_PAGE      5120    /* 20MB */
-#endif
-
-#endif
-
-#ifdef LMK_COUNT_READ
-static uint32_t lmk_count = 0;
-#endif
-static uint32_t lowmem_debug_level = 1;
+static uint32_t lowmem_debug_level = 2;
 static int lowmem_adj[6] = {
 	0,
 	1,
@@ -70,7 +51,7 @@ static int lowmem_adj[6] = {
 	12,
 };
 static int lowmem_adj_size = 4;
-static size_t lowmem_minfree[6] = {
+static int lowmem_minfree[6] = {
 	3 * 512,	/* 6MB */
 	2 * 1024,	/* 8MB */
 	4 * 1024,	/* 16MB */
@@ -79,9 +60,7 @@ static size_t lowmem_minfree[6] = {
 static int lowmem_minfree_size = 4;
 
 #ifdef ENHANCED_LMK_ROUTINE
-static struct task_struct *lowmem_deathpending[LOWMEM_DEATHPENDING_DEPTH] = {
-	NULL,
-};
+static struct task_struct *lowmem_deathpending[LOWMEM_DEATHPENDING_DEPTH] = {NULL,};
 #else
 static struct task_struct *lowmem_deathpending;
 #endif
@@ -104,28 +83,24 @@ static int
 task_notify_func(struct notifier_block *self, unsigned long val, void *data)
 {
 	struct task_struct *task = data;
+
 #ifdef ENHANCED_LMK_ROUTINE
 	int i = 0;
-
-	for (i = 0; i < LOWMEM_DEATHPENDING_DEPTH; i++) {
+	for (i = 0; i < LOWMEM_DEATHPENDING_DEPTH; i++)
 		if (task == lowmem_deathpending[i]) {
 			lowmem_deathpending[i] = NULL;
-			break;
-		}
+		break;
 	}
 #else
 	if (task == lowmem_deathpending)
-		lowmem_print(2, "lowmem_shrink %s/%d is dead!\n",
-				task->comm, task->pid);
 		lowmem_deathpending = NULL;
 #endif
-
 	return NOTIFY_OK;
 }
 
 static int lowmem_shrink(struct shrinker *s, struct shrink_control *sc)
 {
-	struct task_struct *p;
+	struct task_struct *tsk;
 #ifdef ENHANCED_LMK_ROUTINE
 	struct task_struct *selected[LOWMEM_DEATHPENDING_DEPTH] = {NULL,};
 #else
@@ -134,7 +109,7 @@ static int lowmem_shrink(struct shrinker *s, struct shrink_control *sc)
 	int rem = 0;
 	int tasksize;
 	int i;
-	int min_adj = OOM_ADJUST_MAX + 1;
+	int min_score_adj = OOM_SCORE_ADJ_MAX + 1;
 #ifdef ENHANCED_LMK_ROUTINE
 	int selected_tasksize[LOWMEM_DEATHPENDING_DEPTH] = {0,};
 	int selected_oom_adj[LOWMEM_DEATHPENDING_DEPTH] = {OOM_ADJUST_MAX,};
@@ -142,36 +117,17 @@ static int lowmem_shrink(struct shrinker *s, struct shrink_control *sc)
 	int max_selected_oom_idx = 0;
 #else
 	int selected_tasksize = 0;
-	int selected_oom_adj;
+	int selected_oom_score_adj;
 #endif
 	int array_size = ARRAY_SIZE(lowmem_adj);
+#ifndef CONFIG_DMA_CMA
 	int other_free = global_page_state(NR_FREE_PAGES);
+#else
+	int other_free = global_page_state(NR_FREE_PAGES) -
+					global_page_state(NR_FREE_CMA_PAGES);
+#endif
 	int other_file = global_page_state(NR_FILE_PAGES) -
 						global_page_state(NR_SHMEM);
-
-	/*
-	 * If CMA is enabled, then do not count free pages
-	 * from CMA region and also ignore CMA pages that are
-	 * allocated for files.
-	 */
-#ifdef CONFIG_CMA
-	int cma_free, cma_file;
-	int cma_max_free;
-
-	cma_free = global_page_state(NR_FREE_CMA_PAGES);
-	cma_file = global_page_state(NR_CMA_INACTIVE_FILE)
-			+ global_page_state(NR_CMA_ACTIVE_FILE);
-
-#if defined(CONFIG_MACH_CAPRI_SS_BAFFIN)
-	if(cma_free > CMA_ALLOC_MAX_PAGE)
-		cma_max_free = CMA_ALLOC_MAX_PAGE;
-	else
-#endif
-		cma_max_free = cma_free;
-	
-	other_free -= cma_max_free;
-	other_file -= cma_file;
-#endif
 
 	/*
 	 * If we already have a death outstanding, then
@@ -199,29 +155,19 @@ static int lowmem_shrink(struct shrinker *s, struct shrink_control *sc)
 	for (i = 0; i < array_size; i++) {
 		if (other_free < lowmem_minfree[i] &&
 		    other_file < lowmem_minfree[i]) {
-			min_adj = lowmem_adj[i];
+			min_score_adj = lowmem_adj[i];
 			break;
 		}
 	}
 	if (sc->nr_to_scan > 0)
 		lowmem_print(3, "lowmem_shrink %lu, %x, ofree %d %d, ma %d\n",
-			     sc->nr_to_scan, sc->gfp_mask, other_free, other_file,
-			     min_adj);
+				sc->nr_to_scan, sc->gfp_mask, other_free,
+				other_file, min_score_adj);
 	rem = global_page_state(NR_ACTIVE_ANON) +
 		global_page_state(NR_ACTIVE_FILE) +
 		global_page_state(NR_INACTIVE_ANON) +
 		global_page_state(NR_INACTIVE_FILE);
-	/*
-	 * If CMA is enabled, We will also free up contiguous
-	 * allocations done by processes (We cannot free up DMA
-	 * allocations that go from CMA region, but we can't count
-	 * DMA and PMEM allocations separately right now, so we take
-	 * the total.
-	 */
-#ifdef CONFIG_CMA
-	rem += global_page_state(NR_CONTIG_PAGES);
-#endif
-	if (sc->nr_to_scan <= 0 || min_adj == OOM_ADJUST_MAX + 1) {
+	if (sc->nr_to_scan <= 0 || min_score_adj == OOM_SCORE_ADJ_MAX + 1) {
 		lowmem_print(5, "lowmem_shrink %lu, %x, return %d\n",
 			     sc->nr_to_scan, sc->gfp_mask, rem);
 		return rem;
@@ -231,31 +177,28 @@ static int lowmem_shrink(struct shrinker *s, struct shrink_control *sc)
 	for (i = 0; i < LOWMEM_DEATHPENDING_DEPTH; i++)
 		selected_oom_adj[i] = min_adj;
 #else
-	selected_oom_adj = min_adj;
+	selected_oom_score_adj = min_score_adj;
 #endif
-
-	read_lock(&tasklist_lock);
-	for_each_process(p) {
-		struct mm_struct *mm;
-		struct signal_struct *sig;
-		int oom_adj;
+	rcu_read_lock();
+	for_each_process(tsk) {
+		struct task_struct *p;
+		int oom_score_adj;
 #ifdef ENHANCED_LMK_ROUTINE
 		int is_exist_oom_task = 0;
 #endif
+		if (tsk->flags & PF_KTHREAD)
+			continue;
 
-		task_lock(p);
-		mm = p->mm;
-		sig = p->signal;
-		if (!mm || !sig) {
+		p = find_lock_task_mm(tsk);
+		if (!p)
+			continue;
+
+		oom_score_adj = p->signal->oom_score_adj;
+		if (oom_score_adj < min_score_adj) {
 			task_unlock(p);
 			continue;
 		}
-		oom_adj = sig->oom_adj;
-		if (oom_adj < min_adj) {
-			task_unlock(p);
-			continue;
-		}
-		tasksize = get_mm_rss(mm);
+		tasksize = get_mm_rss(p->mm);
 		task_unlock(p);
 		if (tasksize <= 0)
 			continue;
@@ -293,62 +236,50 @@ static int lowmem_shrink(struct shrinker *s, struct shrink_control *sc)
 				}
 			}
 
-			lowmem_print(2, "select %d (%s), adj %d, \
-					size %d, to kill\n",
+			lowmem_print(2, "select %d (%s), adj %d, size %d, to kill\n",
 				p->pid, p->comm, oom_adj, tasksize);
 		}
 #else
 		if (selected) {
-			if (oom_adj < selected_oom_adj)
+			if (oom_score_adj < selected_oom_score_adj)
 				continue;
-			if (oom_adj == selected_oom_adj &&
+			if (oom_score_adj == selected_oom_score_adj &&
 			    tasksize <= selected_tasksize)
 				continue;
 		}
 		selected = p;
 		selected_tasksize = tasksize;
-		selected_oom_adj = oom_adj;
+		selected_oom_score_adj = oom_score_adj;
 		lowmem_print(2, "select %d (%s), adj %d, size %d, to kill\n",
-			     p->pid, p->comm, oom_adj, tasksize);
+			     p->pid, p->comm, oom_score_adj, tasksize);
 #endif
 	}
 #ifdef ENHANCED_LMK_ROUTINE
 	for (i = 0; i < LOWMEM_DEATHPENDING_DEPTH; i++) {
 		if (selected[i]) {
-			lowmem_print(1, "send sigkill to %d (%s), adj %d,\
-				     size %d\n",
-				     selected[i]->pid, selected[i]->comm,
-				     selected_oom_adj[i],
-				     selected_tasksize[i]);
+			lowmem_print(1, "send sigkill to %d (%s), adj %d, size %d\n",
+				selected[i]->pid, selected[i]->comm,
+				selected_oom_adj[i], selected_tasksize[i]);
 			lowmem_deathpending[i] = selected[i];
 			lowmem_deathpending_timeout = jiffies + HZ;
-			send_sig(SIGKILL, selected[i], 0);
+			force_sig(SIGKILL, selected[i]);
 			rem -= selected_tasksize[i];
-#ifdef LMK_COUNT_READ
-			lmk_count++;
-#endif
 		}
 	}
 #else
 	if (selected) {
-		lowmem_print(1, "send sigkill to %d (%s), adj %d, size %d"
-				" with ofree %d %d, cfree %d %d ma %d\n",
+		lowmem_print(1, "send sigkill to %d (%s), adj %d, size %d\n",
 			     selected->pid, selected->comm,
-			     selected_oom_adj, selected_tasksize,
-			     other_free, other_file, cma_free, cma_file,
-			     min_adj);
+			     selected_oom_score_adj, selected_tasksize);
 		lowmem_deathpending = selected;
 		lowmem_deathpending_timeout = jiffies + HZ;
-		force_sig(SIGKILL, selected);
+		send_sig(SIGKILL, selected, 0);
 		rem -= selected_tasksize;
-#ifdef LMK_COUNT_READ
-		lmk_count++;
-#endif
 	}
 #endif
 	lowmem_print(4, "lowmem_shrink %lu, %x, return %d\n",
 		     sc->nr_to_scan, sc->gfp_mask, rem);
-	read_unlock(&tasklist_lock);
+	rcu_read_unlock();
 	return rem;
 }
 
@@ -377,11 +308,8 @@ module_param_array_named(minfree, lowmem_minfree, uint, &lowmem_minfree_size,
 			 S_IRUGO | S_IWUSR);
 module_param_named(debug_level, lowmem_debug_level, uint, S_IRUGO | S_IWUSR);
 
-#ifdef LMK_COUNT_READ
-module_param_named(lmkcount, lmk_count, uint, S_IRUGO);
-#endif
-
 module_init(lowmem_init);
 module_exit(lowmem_exit);
 
 MODULE_LICENSE("GPL");
+
